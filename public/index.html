@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Presensi Wajah MediaPipe + Cloudflare D1</title>
+  <style>
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; padding: 20px; background: #0f172a; color: #f8fafc; }
+    .container { max-width: 1100px; margin: auto; display: grid; grid-template-columns: 1.2fr 1fr; gap: 20px; }
+    @media (max-width: 800px) { .container { grid-template-columns: 1fr; } }
+    .card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+    h2, h3 { margin-top: 0; color: #38bdf8; }
+    .video-box { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 8px; overflow: hidden; }
+    video, canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+    .status-bar { margin-top: 12px; padding: 10px; border-radius: 8px; background: #0f172a; font-weight: 600; text-align: center; }
+    input, button { width: 100%; padding: 10px 12px; margin-top: 8px; border-radius: 8px; border: 1px solid #475569; font-size: 14px; }
+    input { background: #0f172a; color: white; }
+    button { background: #0284c7; color: white; border: none; font-weight: bold; cursor: pointer; }
+    button:hover { background: #0369a1; }
+    button:disabled { background: #475569; cursor: not-allowed; }
+    .list-box { max-height: 220px; overflow-y: auto; margin-top: 10px; border-top: 1px solid #334155; }
+    .list-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; border-bottom: 1px solid #334155; font-size: 13px; }
+    .badge { background: #059669; padding: 2px 8px; border-radius: 99px; font-size: 11px; }
+    .btn-del { width: auto; background: #dc2626; padding: 4px 8px; margin: 0; font-size: 11px; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <div class="card">
+    <h2>Presensi Wajah (Cloudflare D1)</h2>
+    <div class="video-box">
+      <video id="webcam" autoplay playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="status-bar" id="statusText">Memuat model MediaPipe...</div>
+
+    <hr style="border-color: #334155; margin: 16px 0;">
+    <h3>Daftarkan Wajah Baru</h3>
+    <input type="text" id="regName" placeholder="Nama Lengkap (contoh: Budi Santoso)">
+    <input type="text" id="regRole" placeholder="Jabatan / Kelas (contoh: Staff IT)">
+    <button id="btnRegister" disabled>Simpan Wajah ke D1</button>
+  </div>
+
+  <div>
+    <div class="card" style="margin-bottom: 20px;">
+      <h3>Riwayat Presensi Terbaru</h3>
+      <div class="list-box" id="logList">Memuat data...</div>
+    </div>
+
+    <div class="card">
+      <h3>Wajah Terdaftar (<span id="userCount">0</span>)</h3>
+      <div class="list-box" id="userList">Memuat data...</div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+  import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+  const video = document.getElementById("webcam");
+  const canvas = document.getElementById("overlay");
+  const ctx = canvas.getContext("2d");
+  const statusText = document.getElementById("statusText");
+  const btnRegister = document.getElementById("btnRegister");
+
+  let faceLandmarker;
+  let registeredUsers = [];
+  let latestDescriptor = null;
+  let lastMatchedId = null;
+  let lastMatchedTime = 0;
+
+  const KEY_INDICES = [1, 33, 263, 61, 291, 199, 10, 152, 234, 454, 70, 300, 105, 334, 168, 6, 197, 195, 5, 4];
+
+  async function initMediaPipe() {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numFaces: 1
+    });
+    startCamera();
+  }
+
+  async function startCamera() {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    video.srcObject = stream;
+    video.addEventListener("loadeddata", () => {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      btnRegister.disabled = false;
+      syncFromServer();
+      predictLoop();
+    });
+  }
+
+  function extractDescriptor(landmarks) {
+    const nose = landmarks[1];
+    const leftEye = landmarks[33];
+    const rightEye = landmarks[263];
+    const eyeDist = Math.hypot(rightEye.x - leftEye.x, rightEye.y - leftEye.y) || 1;
+    const angle = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x);
+    const cos = Math.cos(-angle);
+    const sin = Math.sin(-angle);
+
+    const vector = [];
+    for (const idx of KEY_INDICES) {
+      const pt = landmarks[idx];
+      const dx = (pt.x - nose.x) / eyeDist;
+      const dy = (pt.y - nose.y) / eyeDist;
+      const dz = (pt.z - nose.z) / eyeDist;
+      vector.push(dx * cos - dy * sin, dx * sin + dy * cos, dz);
+    }
+    return vector;
+  }
+
+  function euclideanDistance(v1, v2) {
+    let sum = 0;
+    for (let i = 0; i < v1.length; i++) {
+      sum += (v1[i] - v2[i]) ** 2;
+    }
+    return Math.sqrt(sum);
+  }
+
+  function predictLoop() {
+    const results = faceLandmarker.detectForVideo(video, performance.now());
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+      const landmarks = results.faceLandmarks[0];
+      latestDescriptor = extractDescriptor(landmarks);
+
+      ctx.fillStyle = "#38bdf8";
+      for (const pt of landmarks) {
+        ctx.fillRect(pt.x * canvas.width, pt.y * canvas.height, 2, 2);
+      }
+
+      let bestMatch = null;
+      let minDist = Infinity;
+
+      for (const user of registeredUsers) {
+        const dist = euclideanDistance(latestDescriptor, user.descriptor);
+        if (dist < minDist) {
+          minDist = dist;
+          bestMatch = user;
+        }
+      }
+
+      if (bestMatch && minDist < 0.42) {
+        const confidence = Math.max(0, Math.min(100, Math.round((1 - minDist) * 100)));
+        statusText.innerHTML = `✅ Terdeteksi: <span style="color:#4ade80">${bestMatch.name}</span> (${confidence}%)`;
+
+        const now = Date.now();
+        if (lastMatchedId !== bestMatch.id || now - lastMatchedTime > 15000) {
+          lastMatchedId = bestMatch.id;
+          lastMatchedTime = now;
+          recordAttendance(bestMatch, confidence);
+        }
+      } else {
+        statusText.innerHTML = `⚠️ Wajah tidak dikenal (Jarak: ${minDist === Infinity ? '-' : minDist.toFixed(2)})`;
+      }
+    } else {
+      latestDescriptor = null;
+      statusText.textContent = "Arahkan wajah ke kamera...";
+    }
+
+    requestAnimationFrame(predictLoop);
+  }
+
+  async function syncFromServer() {
+    const res = await fetch("/api/sync");
+    const data = await res.json();
+    registeredUsers = data.users || [];
+    renderUsers(registeredUsers);
+    renderLogs(data.logs || []);
+  }
+
+  async function recordAttendance(user, confidence) {
+    const res = await fetch("/api/attendance", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: user.id, name: user.name, confidence })
+    });
+    const result = await res.json();
+    if (result.success) syncFromServer();
+  }
+
+  btnRegister.addEventListener("click", async () => {
+    const name = document.getElementById("regName").value.trim();
+    const role = document.getElementById("regRole").value.trim();
+    if (!name || !latestDescriptor) {
+      alert("Pastikan nama diisi dan wajah terlihat di kamera!");
+      return;
+    }
+
+    btnRegister.disabled = true;
+    btnRegister.textContent = "Menyimpan...";
+
+    await fetch("/api/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "USR-" + Date.now(),
+        name,
+        role,
+        descriptor: latestDescriptor
+      })
+    });
+
+    document.getElementById("regName").value = "";
+    document.getElementById("regRole").value = "";
+    btnRegister.disabled = false;
+    btnRegister.textContent = "Simpan Wajah ke D1";
+    syncFromServer();
+  });
+
+  window.deleteUser = async (id) => {
+    if (!confirm("Hapus user ini?")) return;
+    await fetch(`/api/users/${id}`, { method: "DELETE" });
+    syncFromServer();
+  };
+
+  function renderUsers(users) {
+    document.getElementById("userCount").textContent = users.length;
+    document.getElementById("userList").innerHTML = users.map(u => `
+      <div class="list-item">
+        <div><strong>${u.name}</strong> <small style="color:#94a3b8">(${u.role})</small></div>
+        <button class="btn-del" onclick="deleteUser('${u.id}')">Hapus</button>
+      </div>
+    `).join("") || "<p style='color:#64748b;font-size:13px'>Belum ada wajah terdaftar.</p>";
+  }
+
+  function renderLogs(logs) {
+    document.getElementById("logList").innerHTML = logs.map(l => `
+      <div class="list-item">
+        <div>
+          <strong>${l.name}</strong><br>
+          <small style="color:#94a3b8">${l.timestamp} UTC</small>
+        </div>
+        <span class="badge">${l.confidence}%</span>
+      </div>
+    `).join("") || "<p style='color:#64748b;font-size:13px'>Belum ada riwayat absen.</p>";
+  }
+
+  initMediaPipe();
+</script>
+</body>
+</html>
